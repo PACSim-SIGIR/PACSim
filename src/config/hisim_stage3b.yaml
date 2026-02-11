@@ -1,0 +1,127 @@
+runner: "episode_runner"
+mac: "basic_mac"
+learner: "q_learner"
+
+# Stage3b: core action imitation (offline). Must load a meaningful belief checkpoint.
+load_model_path: ""
+
+t_max: 50000
+test_interval: 2000
+test_nepisode: 1000
+eval_dataset_split: "test"
+
+n_agents: 3
+belief_dim: 128
+batch_size_run: 1
+
+n_actions: 5
+env_action_source: "discrete_action_boxed"
+
+enable_llm_rollout: false
+together_api_key: ""
+coordinator_model: "gpt-3.5-turbo"
+executor_model: "gpt-3.5-turbo"
+llm_model_name: "gpt2"
+
+train_belief_supervised: true
+supervised_metric_prefix: "action_sup"
+use_mixer: false
+belief_supervised_use_soft_labels: true
+belief_supervised_soft_label_mix: 0.4
+belief_supervised_label_smoothing: 0.08
+belief_supervised_micro_batch_size: 128
+belief_supervised_metrics_use_argmax: false
+belief_supervised_class_weights: [2.2, 1.0, 1.0, 1.0, 1.0]
+
+freeze_belief_encoder_in_supervised: true
+train_action_imitation: true
+action_imitation_binary_01: true
+s3b_preference_scorer: true
+
+# Condition S3b on z_t (requires dataset emitting z_t)
+use_population_belief_in_action_head: true
+population_belief_dim: 3
+s3b_z_drop_prob: 0.1
+s3b_z_shuffle_prob: 0.0
+
+# Only supervise action ids {0,1} (post/retweet) in S3b loss
+action_imitation_supervised_action_ids: [0, 1]
+
+s3b_boxed_action_selection: "sample"
+s3b_boxed_action_temperature: 1.0
+s3b_boxed_action_epsilon: 0.05
+
+lr: 0.0003
+belief_net_lr: 0.0001
+encoder_lr: 0.0
+mixer_lr: 0.0
+weight_decay: 0.0
+lambda_sd: 0.0
+lambda_m: 0.0
+
+arch:
+  entity_dim: 256
+  attention_heads: 4
+  transformer_blocks: 2
+  key_dim: 64
+  mlp_hidden_size: 256
+  feedforward_size: 1024
+  dropout_rate: 0.1
+  layer_norm_epsilon: 0.00001
+
+prompt_attention_heads: 2
+commitment_embedding_dim: 1024
+
+env: "huggingface_dataset_env"
+env_args:
+  hf_dataset_path:
+    - "./data/stage_3b_action_metoo_e1"
+    - "./data/stage_3b_action_metoo_e2"
+  dataset_split: "train"
+  question_field_name: "question"
+  answer_field_name: "answer"
+  max_question_length: 1024
+  max_answer_length: 128
+  dataset_streaming: false
+  use_random_sampling: true
+  verbose_step_logging: false
+  infer_target_distribution_from_question: true
+  infer_target_distribution_log_limit: 3
+  filter_is_core_user: "core"
+  n_actions: 5
+  oversample_enabled: true
+  oversample_only_train: true
+  oversample_label_id: 0
+  oversample_condition_label_ids: [0, 1]
+  oversample_target_ratio: 0.20
+  oversample_seed: 42
+
+# No reward / RL signals
+reward:
+  al_weight: 0.0
+  ts_weight: 0.0
+  cc_weight: 0.0
+
+train:
+  buffer_size: 512
+  batch_size: 128
+  update_interval: 1
+  optimizer: "adam"
+  learning_rate: 0.001
+  coordinator_learning_rate: 0.0005
+  gamma: 0.99
+
+system:
+  use_cuda: true
+  device_num: 0
+  seed: 42
+  debug: false
+
+logging:
+  use_tensorboard: true
+  log_interval: 50
+  save_model: true
+  save_model_interval: 5000
+  checkpoint_path: "./models"
+  log_path: "./logs"
+  experiment_name: "hisim-action-imitation-s3b"

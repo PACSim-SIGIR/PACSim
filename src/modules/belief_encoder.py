@@ -1,0 +1,727 @@
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from typing import List, Dict, Tuple, Any, Optional
+
+
+class BeliefEncoder(nn.Module):
+
+    
+    def __init__(
+        self,
+        belief_dim: int,
+        n_agents: int,
+        n_heads: int = 4,
+        key_dim: int = 64,
+        device: torch.device = None,
+        population_belief_dim: int = 3,
+        use_population_token: bool = True,
+        n_stages: int = 13,
+        use_stage_token: bool = False,
+        use_brief_encoder: bool = False,
+        brief_encoder_input_dim: int = 128,
+        brief_encoder_hidden_dim: int = 256,
+        brief_encoder_use_stage: bool = False,
+        use_population_update_head: bool = True,
+        population_update_hidden_dim: int = 128,
+        population_update_use_group_repr: bool = True,
+        population_update_use_stage: bool = False,
+        population_update_parametrization: str = "categorical",
+        dirichlet_alpha_min: float = 1e-3,
+        population_update_use_extra_cond: bool = False,
+        population_update_extra_cond_dim: int = 0,
+        population_update_residual_mixing: bool = True,
+        population_update_mixing_init: float = 0.5,
+        population_update_mixing_learnable: bool = True,
+        secondary_action_dim: int = 5,
+        use_secondary_action_head: bool = False,
+        secondary_action_hidden_dim: int = 128,
+        secondary_action_use_group_repr: bool = True,
+        secondary_action_use_stage: bool = False,
+        secondary_action_use_population: bool = True,
+    ):
+        """
+        初始化置信编码器。
+        
+        Args:
+            belief_dim: 置信状态的维度
+            n_agents: 智能体数量
+            n_heads: 注意力头数量
+            key_dim: 每个注意力头的维度
+            device: 计算设备
+            population_belief_dim: 边缘用户的 latent population belief z 的维度（默认 3 类 stance）
+            use_population_token: 是否将 population belief 作为额外 token 融入注意力聚合
+            n_stages: stage 数（用于可选的 stage token）
+            use_stage_token: 是否加入 stage token（用于时序条件化；默认关闭以保持行为稳定）
+        """
+        super(BeliefEncoder, self).__init__()
+        
+        self.belief_dim = belief_dim
+        self.n_agents = n_agents
+        self.n_heads = n_heads
+        self.key_dim = key_dim
+        self.device = device if device else torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
+        self.population_belief_dim = int(population_belief_dim)
+        self.use_population_token = bool(use_population_token)
+        self.n_stages = int(n_stages)
+        self.use_stage_token = bool(use_stage_token)
+
+        self.use_brief_encoder = bool(use_brief_encoder)
+        self.brief_encoder_input_dim = int(brief_encoder_input_dim)
+        self.brief_encoder_hidden_dim = int(brief_encoder_hidden_dim)
+        self.brief_encoder_use_stage = bool(brief_encoder_use_stage)
+
+        self.use_population_update_head = bool(use_population_update_head)
+        self.population_update_hidden_dim = int(population_update_hidden_dim)
+        self.population_update_use_group_repr = bool(population_update_use_group_repr)
+        self.population_update_use_stage = bool(population_update_use_stage)
+        self.population_update_parametrization = str(population_update_parametrization or "categorical").strip().lower()
+        if self.population_update_parametrization in ("dirichlet", "dir", "dirichlet_alpha", "alpha"):
+            self.population_update_parametrization = "dirichlet"
+        else:
+            self.population_update_parametrization = "categorical"
+        self.dirichlet_alpha_min = float(dirichlet_alpha_min) if dirichlet_alpha_min is not None else 1e-3
+        if self.dirichlet_alpha_min <= 0:
+            self.dirichlet_alpha_min = 1e-6
+        self.population_update_use_extra_cond = bool(population_update_use_extra_cond)
+        self.population_update_extra_cond_dim = int(population_update_extra_cond_dim)
+        self.population_update_residual_mixing = bool(population_update_residual_mixing)
+        self.population_update_mixing_init = float(population_update_mixing_init)
+        self.population_update_mixing_learnable = bool(population_update_mixing_learnable)
+
+        self.secondary_action_dim = int(secondary_action_dim)
+        self.use_secondary_action_head = bool(use_secondary_action_head)
+        self.secondary_action_hidden_dim = int(secondary_action_hidden_dim)
+        self.secondary_action_use_group_repr = bool(secondary_action_use_group_repr)
+        self.secondary_action_use_stage = bool(secondary_action_use_stage)
+        self.secondary_action_use_population = bool(secondary_action_use_population)
+        
+        self.multihead_attn = nn.MultiheadAttention(
+            embed_dim=belief_dim,
+            num_heads=n_heads,
+            batch_first=True
+        )
+
+        if self.use_population_token:
+            self.population_proj = nn.Sequential(
+                nn.Linear(self.population_belief_dim, belief_dim),
+                nn.LayerNorm(belief_dim),
+                nn.Tanh(),
+            )
+        else:
+            self.population_proj = None
+
+        need_stage_embed = bool(self.use_stage_token or self.population_update_use_stage or self.secondary_action_use_stage)
+        if need_stage_embed:
+            self.stage_embed = nn.Embedding(max(1, self.n_stages) + 1, belief_dim)
+        else:
+            self.stage_embed = None
+
+        self.brief_encoder: Optional[nn.Module]
+        if self.use_brief_encoder:
+            in_dim = max(1, int(self.brief_encoder_input_dim))
+            if self.brief_encoder_use_stage:
+                in_dim += belief_dim
+            hid = max(8, int(self.brief_encoder_hidden_dim))
+            self.brief_encoder = nn.Sequential(
+                nn.Linear(in_dim, hid),
+                nn.ReLU(),
+                nn.Linear(hid, belief_dim),
+                nn.LayerNorm(belief_dim),
+                nn.Tanh(),
+            )
+        else:
+            self.brief_encoder = None
+
+        self.population_update_head: Optional[nn.Module]
+        if self.use_population_update_head:
+            in_dim = self.population_belief_dim
+            if self.population_update_use_group_repr:
+                in_dim += belief_dim
+            if self.population_update_use_stage:
+                in_dim += belief_dim
+            if self.population_update_use_extra_cond:
+                in_dim += max(0, int(self.population_update_extra_cond_dim))
+            hid = max(8, self.population_update_hidden_dim)
+            self.population_update_head = nn.Sequential(
+                nn.Linear(in_dim, hid),
+                nn.ReLU(),
+                nn.Linear(hid, hid),
+                nn.ReLU(),
+                nn.Linear(hid, self.population_belief_dim),
+            )
+            if self.population_update_residual_mixing:
+                if self.population_update_mixing_learnable:
+                    init = torch.tensor(self.population_update_mixing_init).clamp(0.0, 1.0)
+                    eps = 1e-6
+                    init = torch.clamp(init, eps, 1 - eps)
+                    init_logit = torch.log(init / (1 - init))
+                    self.population_update_mix_logit = nn.Parameter(init_logit)
+                else:
+                    self.register_buffer(
+                        "population_update_mix_const",
+                        torch.tensor(self.population_update_mixing_init).clamp(0.0, 1.0),
+                        persistent=False,
+                    )
+                    self.population_update_mix_logit = None
+            else:
+                self.population_update_mix_logit = None
+        else:
+            self.population_update_head = None
+
+        self.secondary_action_head: Optional[nn.Module]
+        if self.use_secondary_action_head:
+            in_dim = 0
+            if self.secondary_action_use_population:
+                in_dim += self.population_belief_dim
+            if self.secondary_action_use_group_repr:
+                in_dim += belief_dim
+            if self.secondary_action_use_stage:
+                in_dim += belief_dim
+            hid = max(8, self.secondary_action_hidden_dim)
+            self.secondary_action_head = nn.Sequential(
+                nn.Linear(in_dim, hid),
+                nn.ReLU(),
+                nn.Linear(hid, hid),
+                nn.ReLU(),
+                nn.Linear(hid, self.secondary_action_dim),
+            )
+        else:
+            self.secondary_action_head = None
+        
+        self.out_proj = nn.Linear(belief_dim, belief_dim)
+        
+        self.layer_norm = nn.LayerNorm(belief_dim)
+        
+        self.feedforward = nn.Sequential(
+            nn.Linear(belief_dim, 4 * belief_dim),
+            nn.ReLU(),
+            nn.Linear(4 * belief_dim, belief_dim)
+        )
+        
+        self.final_layer_norm = nn.LayerNorm(belief_dim)
+
+    def encode_brief(
+        self,
+        brief_features: torch.Tensor,
+        *,
+        stage_t: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """
+        Encode a non-parametric action-summary vector into a compact brief embedding g_t.
+
+        Args:
+            brief_features: Tensor [bs, D] or [D]
+            stage_t: Optional stage index [bs] or [bs,1] (only used when brief_encoder_use_stage=True)
+        Returns:
+            g_t: Tensor [bs, belief_dim]
+        """
+        if self.brief_encoder is None:
+            raise RuntimeError("brief_encoder is disabled. Set use_brief_encoder=True to enable it.")
+        x = brief_features
+        if not isinstance(x, torch.Tensor):
+            x = torch.tensor(x, dtype=torch.float32, device=self.device)
+        if x.ndim == 1:
+            x = x.unsqueeze(0)
+        x = x.to(self.device, dtype=torch.float32)
+        if int(x.size(-1)) != int(self.brief_encoder_input_dim):
+            d = int(self.brief_encoder_input_dim)
+            if int(x.size(-1)) > d:
+                x = x[..., :d]
+            else:
+                pad = torch.zeros(x.size(0), d - int(x.size(-1)), device=x.device, dtype=x.dtype)
+                x = torch.cat([x, pad], dim=-1)
+        if self.brief_encoder_use_stage:
+            if stage_t is None or self.stage_embed is None:
+                raise ValueError("brief_encoder_use_stage=True but stage_t/stage_embed is missing.")
+            st = stage_t
+            if isinstance(st, torch.Tensor):
+                if st.ndim == 2 and st.shape[-1] == 1:
+                    st = st.squeeze(-1)
+                st = st.reshape(-1).long().to(self.device)
+            else:
+                st = torch.tensor([int(st)], dtype=torch.int64, device=self.device)
+            st = torch.clamp(st, min=0, max=max(0, int(self.n_stages)))
+            st_tok = self.stage_embed(st)  # (bs, belief_dim)
+            x = torch.cat([x, st_tok], dim=-1)
+        return self.brief_encoder(x)
+        
+    def forward(
+        self,
+        belief_states: torch.Tensor,
+        *,
+        population_belief: Optional[torch.Tensor] = None,
+        stage_t: Optional[torch.Tensor] = None,
+        return_tokens: bool = False,
+    ) -> torch.Tensor:
+        """
+        前向传播，聚合智能体置信状态产生群体表征。
+
+        兼容旧接口：只传 belief_states 也可运行。
+        为 HiSim 社交仿真扩展：可选传入 population_belief(z) 作为额外 token，显式建模 700 边缘用户的 latent population belief。
+        
+        Args:
+            belief_states: 所有智能体的置信状态 [batch_size, n_agents, belief_dim]
+            population_belief: population belief z（例如 3 类 stance 分布）[batch_size, K]
+            stage_t: stage index [batch_size] 或 [batch_size, 1]（可选）
+            return_tokens: True 时返回 dict（含 group_repr/tokens）；False 时仅返回 group_repr
+            
+        Returns:
+            群体表征 E [batch_size, belief_dim]（或 return_tokens=True 时返回 dict）
+        """
+        if belief_states.ndim != 3:
+            raise ValueError(f"belief_states 期望形状 [bs, n_agents, belief_dim]，实际={tuple(belief_states.shape)}")
+        batch_size = belief_states.shape[0]
+        tokens = belief_states  # (bs, n_agents, belief_dim)
+
+        extra_tokens: List[torch.Tensor] = []
+
+        if self.use_population_token and self.population_proj is not None and population_belief is not None:
+            if population_belief.ndim == 1:
+                population_belief = population_belief.unsqueeze(0)  # (K,) -> (1,K)
+            if population_belief.ndim == 3 and population_belief.shape[1] == 1:
+                population_belief = population_belief.squeeze(1)
+            pop_token = self.population_proj(population_belief.to(tokens.device, dtype=tokens.dtype)).unsqueeze(1)  # (bs,1,belief_dim)
+            extra_tokens.append(pop_token)
+
+        if self.use_stage_token and self.stage_embed is not None and stage_t is not None:
+            st = stage_t
+            if st.ndim == 2 and st.shape[1] == 1:
+                st = st.squeeze(1)
+            if st.ndim != 1:
+                raise ValueError(f"stage_t 期望形状 [bs] 或 [bs,1]，实际={tuple(stage_t.shape)}")
+            st = st.to(tokens.device, dtype=torch.long).clamp(min=0, max=self.n_stages)
+            st_token = self.stage_embed(st).unsqueeze(1)  # (bs,1,belief_dim)
+            extra_tokens.append(st_token)
+
+        if extra_tokens:
+            tokens = torch.cat([tokens] + extra_tokens, dim=1)  # (bs, n_agents + n_extra, belief_dim)
+        
+        attn_output, _ = self.multihead_attn(
+            query=tokens,
+            key=tokens,
+            value=tokens
+        )
+        
+        attn_output = tokens + attn_output
+        attn_output = self.layer_norm(attn_output)
+        
+        ff_output = self.feedforward(attn_output)
+        
+        ff_output = attn_output + ff_output
+        ff_output = self.final_layer_norm(ff_output)
+        
+        group_repr = ff_output[:, : self.n_agents].mean(dim=1)  # [batch_size, belief_dim]
+        
+        group_repr = self.out_proj(group_repr)
+
+        if return_tokens:
+            return {
+                "group_repr": group_repr,
+                "tokens": ff_output,
+            }
+
+        return group_repr
+
+    def predict_next_population_belief(
+        self,
+        z_t: torch.Tensor,
+        *,
+        group_repr: Optional[torch.Tensor] = None,
+        stage_t: Optional[torch.Tensor] = None,
+        extra_cond: Optional[torch.Tensor] = None,
+        return_logits: bool = False,
+    ) -> torch.Tensor:
+        """
+        Population Belief Update Head：根据当前 z(t)（可选条件 group_repr / stage）预测 z(t+1)。
+
+        Args:
+            z_t: [bs, K] 或 [K]
+            group_repr: [bs, belief_dim]（可选）
+            stage_t: [bs] 或 [bs,1]（可选；仅当 population_update_use_stage=True 时使用）
+            return_logits: True 返回 logits；False 返回 softmax 后的概率分布
+
+        Returns:
+            z_next: [bs, K]（logits 或 probs）
+        """
+        if self.population_update_head is None:
+            raise RuntimeError("population_update_head 未启用：请设置 use_population_update_head=True")
+
+        if z_t.ndim == 1:
+            z_t = z_t.unsqueeze(0)
+        if z_t.ndim != 2:
+            raise ValueError(f"z_t 期望形状 [bs,K] 或 [K]，实际={tuple(z_t.shape)}")
+        if z_t.size(-1) != self.population_belief_dim:
+            raise ValueError(f"z_t 最后一维应为 K={self.population_belief_dim}，实际={z_t.size(-1)}")
+
+        parts = [z_t]
+
+        if self.population_update_use_group_repr:
+            if group_repr is None:
+                raise ValueError("population_update_use_group_repr=True 但未提供 group_repr")
+            if group_repr.ndim == 1:
+                group_repr = group_repr.unsqueeze(0)
+            if group_repr.ndim != 2 or group_repr.size(-1) != self.belief_dim:
+                raise ValueError(f"group_repr 期望形状 [bs, belief_dim]，实际={tuple(group_repr.shape)}")
+            parts.append(group_repr)
+
+        if self.population_update_use_stage:
+            if stage_t is None or self.stage_embed is None:
+                raise ValueError("population_update_use_stage=True 但未提供 stage_t 或 stage_embed 未初始化")
+            st = stage_t
+            if st.ndim == 2 and st.shape[1] == 1:
+                st = st.squeeze(1)
+            if st.ndim != 1:
+                raise ValueError(f"stage_t 期望形状 [bs] 或 [bs,1]，实际={tuple(stage_t.shape)}")
+            st = st.to(z_t.device, dtype=torch.long).clamp(min=0, max=self.n_stages)
+            st_tok = self.stage_embed(st)
+            parts.append(st_tok)
+
+        if self.population_update_use_extra_cond and extra_cond is not None:
+            ec = extra_cond
+            if ec.ndim == 1:
+                ec = ec.unsqueeze(0)
+            if ec.ndim != 2:
+                raise ValueError(f"extra_cond 期望形状 [bs, D]，实际={tuple(extra_cond.shape)}")
+            if int(self.population_update_extra_cond_dim) > 0 and ec.size(-1) != int(self.population_update_extra_cond_dim):
+                raise ValueError(
+                    f"extra_cond dim 不匹配: expect D={int(self.population_update_extra_cond_dim)} got {ec.size(-1)}"
+                )
+            parts.append(ec)
+
+        x = torch.cat(parts, dim=-1)
+        logits = self.population_update_head(x)
+        if return_logits:
+            return logits
+        if int(self.population_belief_dim) == 1:
+            z_hat = torch.tanh(logits)
+            if self.population_update_residual_mixing:
+                z_in = torch.clamp(z_t, min=-1.0, max=1.0)
+                if self.population_update_mixing_learnable and self.population_update_mix_logit is not None:
+                    mix = torch.sigmoid(self.population_update_mix_logit)  # scalar
+                else:
+                    mix = getattr(self, "population_update_mix_const", torch.tensor(self.population_update_mixing_init, device=z_hat.device))
+                mix = mix.to(z_hat.device, dtype=z_hat.dtype).view(1, 1)
+                z_hat = mix * z_hat + (1.0 - mix) * z_in
+            return torch.clamp(z_hat, min=-1.0, max=1.0)
+
+        if self.population_update_parametrization == "dirichlet":
+            alpha = self._dirichlet_alpha_from_logits(logits)  # (bs,K) positive
+            mean = self.population_belief_mean_from_alpha(alpha)  # (bs,K)
+            if self.population_update_residual_mixing:
+                z_in = torch.clamp(z_t, min=0.0)
+                z_in = z_in / torch.clamp(z_in.sum(dim=-1, keepdim=True), min=1e-8)
+                mix = None
+                if self.population_update_mixing_learnable and self.population_update_mix_logit is not None:
+                    mix = torch.sigmoid(self.population_update_mix_logit)  # scalar
+                else:
+                    mix = getattr(self, "population_update_mix_const", torch.tensor(self.population_update_mixing_init, device=mean.device))
+                mix = mix.to(mean.device, dtype=mean.dtype).view(1, 1)
+                mean = mix * mean + (1.0 - mix) * z_in
+                mean = mean / torch.clamp(mean.sum(dim=-1, keepdim=True), min=1e-8)
+            return mean
+
+        z_hat = F.softmax(logits, dim=-1)
+        if self.population_update_residual_mixing:
+            z_in = torch.clamp(z_t, min=0.0)
+            z_in = z_in / torch.clamp(z_in.sum(dim=-1, keepdim=True), min=1e-8)
+            mix = None
+            if self.population_update_mixing_learnable and self.population_update_mix_logit is not None:
+                mix = torch.sigmoid(self.population_update_mix_logit)  # scalar
+            else:
+                mix = getattr(self, "population_update_mix_const", torch.tensor(self.population_update_mixing_init, device=z_hat.device))
+            mix = mix.to(z_hat.device, dtype=z_hat.dtype).view(1, 1)
+            z_out = mix * z_hat + (1.0 - mix) * z_in
+            return z_out / torch.clamp(z_out.sum(dim=-1, keepdim=True), min=1e-8)
+        return z_hat
+
+    def _dirichlet_alpha_from_logits(self, logits: torch.Tensor) -> torch.Tensor:
+        """
+        Convert unconstrained head output logits -> Dirichlet alpha (>0).
+        We use softplus for stable positivity, plus a small floor.
+        """
+        alpha = F.softplus(logits) + float(self.dirichlet_alpha_min)
+        return alpha
+
+    @staticmethod
+    def population_belief_mean_from_alpha(alpha: torch.Tensor, eps: float = 1e-8) -> torch.Tensor:
+        """E[z] for Dirichlet(alpha): alpha / sum(alpha)."""
+        a = torch.clamp(alpha, min=0.0)
+        return a / torch.clamp(a.sum(dim=-1, keepdim=True), min=eps)
+
+    def predict_next_population_belief_alpha(
+        self,
+        z_t: torch.Tensor,
+        *,
+        group_repr: Optional[torch.Tensor] = None,
+        stage_t: Optional[torch.Tensor] = None,
+        extra_cond: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """
+        Return Dirichlet alpha for z(t+1).
+        - Only valid when population_belief_dim>1 and population_update_parametrization=="dirichlet".
+        - If residual mixing is enabled, we mix in mean-space but keep alpha0 (=sum alpha) from the head.
+        """
+        if int(self.population_belief_dim) == 1:
+            raise RuntimeError("predict_next_population_belief_alpha is not defined for scalar z (population_belief_dim==1).")
+        if self.population_update_parametrization != "dirichlet":
+            raise RuntimeError("predict_next_population_belief_alpha requires population_update_parametrization='dirichlet'.")
+        logits = self.predict_next_population_belief(
+            z_t,
+            group_repr=group_repr,
+            stage_t=stage_t,
+            extra_cond=extra_cond,
+            return_logits=True,
+        )
+        alpha = self._dirichlet_alpha_from_logits(logits)
+        if self.population_update_residual_mixing:
+            mean = self.population_belief_mean_from_alpha(alpha)
+            z_in = z_t
+            if z_in.ndim == 1:
+                z_in = z_in.unsqueeze(0)
+            z_in = torch.clamp(z_in, min=0.0)
+            z_in = z_in / torch.clamp(z_in.sum(dim=-1, keepdim=True), min=1e-8)
+            mix = None
+            if self.population_update_mixing_learnable and self.population_update_mix_logit is not None:
+                mix = torch.sigmoid(self.population_update_mix_logit)  # scalar
+            else:
+                mix = getattr(self, "population_update_mix_const", torch.tensor(self.population_update_mixing_init, device=mean.device))
+            mix = mix.to(mean.device, dtype=mean.dtype).view(1, 1)
+            mean = mix * mean + (1.0 - mix) * z_in
+            mean = mean / torch.clamp(mean.sum(dim=-1, keepdim=True), min=1e-8)
+            alpha0 = torch.clamp(alpha.sum(dim=-1, keepdim=True), min=float(self.dirichlet_alpha_min) * float(self.population_belief_dim))
+            alpha = torch.clamp(mean * alpha0, min=float(self.dirichlet_alpha_min))
+        return alpha
+
+    def compute_population_belief_loss_dirichlet_kl(
+        self,
+        alpha_pred: torch.Tensor,   # [bs, K] (alpha > 0)
+        z_target: torch.Tensor,     # [bs, K] (target mean on simplex)
+        z_mask: torch.Tensor,       # [bs] or [bs,1]
+        *,
+        alpha0_target: Any = 10.0,
+    ) -> torch.Tensor:
+        """
+        Dirichlet KL supervision with mask:
+          loss = KL( Dir(alpha_target) || Dir(alpha_pred) )
+
+        We only have z_target as a distribution (mean). We construct a target Dirichlet by:
+          alpha_target = alpha0_target * z_target + alpha_min
+        """
+        eps = 1e-8
+        if alpha_pred.ndim == 1:
+            alpha_pred = alpha_pred.unsqueeze(0)
+        if z_target.ndim == 1:
+            z_target = z_target.unsqueeze(0)
+        if alpha_pred.ndim != 2 or z_target.ndim != 2:
+            raise ValueError(f"alpha_pred/z_target 期望 [bs,K]，实际 alpha_pred={tuple(alpha_pred.shape)} z_target={tuple(z_target.shape)}")
+        if alpha_pred.size(-1) != z_target.size(-1):
+            raise ValueError(f"K 不一致: alpha_pred K={alpha_pred.size(-1)} vs z_target K={z_target.size(-1)}")
+        if int(alpha_pred.size(-1)) == 1:
+            raise RuntimeError("Dirichlet KL is not defined for K=1 scalar mode.")
+
+        zt = torch.clamp(z_target, min=0.0)
+        zt = zt / torch.clamp(zt.sum(dim=-1, keepdim=True), min=eps)
+
+        a_min = float(self.dirichlet_alpha_min)
+        a0_t = alpha0_target
+        if isinstance(a0_t, torch.Tensor):
+            a0v = a0_t
+            if a0v.ndim == 2 and a0v.shape[-1] == 1:
+                a0v = a0v.squeeze(-1)
+            if a0v.ndim != 1:
+                a0v = a0v.reshape(-1)
+            a0v = a0v.to(device=zt.device, dtype=zt.dtype)
+            a0v = torch.nan_to_num(a0v, nan=0.0, posinf=0.0, neginf=0.0)
+            a0v = torch.clamp(a0v, min=1.0)
+            alpha_tgt = (a0v.unsqueeze(-1) * zt) + a_min
+        else:
+            try:
+                a0 = float(a0_t) if a0_t is not None else 10.0
+            except Exception:
+                a0 = 10.0
+            if a0 <= 0:
+                a0 = 10.0
+            alpha_tgt = (a0 * zt) + a_min
+
+        ap = torch.clamp(alpha_pred, min=a_min)
+        at = torch.clamp(alpha_tgt, min=a_min)
+
+        at0 = at.sum(dim=-1)
+        ap0 = ap.sum(dim=-1)
+        t1 = torch.lgamma(at0) - torch.sum(torch.lgamma(at), dim=-1)
+        t2 = torch.lgamma(ap0) - torch.sum(torch.lgamma(ap), dim=-1)
+        dig_at = torch.digamma(at)
+        dig_at0 = torch.digamma(at0).unsqueeze(-1)
+        t3 = torch.sum((at - ap) * (dig_at - dig_at0), dim=-1)
+        kl = (t1 - t2 + t3)
+
+        if z_mask.ndim == 2 and z_mask.shape[-1] == 1:
+            z_mask = z_mask.squeeze(-1)
+        m = z_mask.to(ap.device, dtype=ap.dtype).clamp(min=0.0, max=1.0)
+        kl = kl * m
+        return kl.sum() / (m.sum() + eps)
+
+    def predict_secondary_action_probs(
+        self,
+        *,
+        z_t: Optional[torch.Tensor] = None,
+        group_repr: Optional[torch.Tensor] = None,
+        stage_t: Optional[torch.Tensor] = None,
+        return_logits: bool = False,
+    ) -> torch.Tensor:
+        """
+        Secondary Action Belief Head：预测次要用户的 action_type 分布（例如 5 类：post/retweet/reply/like/do_nothing）。
+
+        Args:
+            z_t: [bs, K] 或 [K]（可选；仅当 secondary_action_use_population=True 时需要）
+            group_repr: [bs, belief_dim]（可选；仅当 secondary_action_use_group_repr=True 时需要）
+            stage_t: [bs] 或 [bs,1]（可选；仅当 secondary_action_use_stage=True 时需要）
+            return_logits: True 返回 logits；False 返回 softmax 后的概率分布
+
+        Returns:
+            action_probs/logits: [bs, A]
+        """
+        if self.secondary_action_head is None:
+            raise RuntimeError("secondary_action_head 未启用：请设置 use_secondary_action_head=True")
+
+        xs: List[torch.Tensor] = []
+        device = None
+        dtype = None
+
+        if self.secondary_action_use_population:
+            if z_t is None:
+                raise ValueError("secondary_action_use_population=True 但未提供 z_t")
+            zz = z_t
+            if zz.ndim == 1:
+                zz = zz.unsqueeze(0)
+            if zz.ndim != 2 or zz.size(-1) != self.population_belief_dim:
+                raise ValueError(f"z_t 期望 [bs,K]，实际={tuple(zz.shape)}")
+            device = zz.device
+            dtype = zz.dtype
+            xs.append(zz)
+
+        if self.secondary_action_use_group_repr:
+            if group_repr is None:
+                raise ValueError("secondary_action_use_group_repr=True 但未提供 group_repr")
+            gg = group_repr
+            if gg.ndim == 1:
+                gg = gg.unsqueeze(0)
+            if gg.ndim != 2 or gg.size(-1) != self.belief_dim:
+                raise ValueError(f"group_repr 期望 [bs, belief_dim]，实际={tuple(gg.shape)}")
+            device = gg.device if device is None else device
+            dtype = gg.dtype if dtype is None else dtype
+            xs.append(gg)
+
+        if self.secondary_action_use_stage:
+            if stage_t is None or self.stage_embed is None:
+                raise ValueError("secondary_action_use_stage=True 但未提供 stage_t 或 stage_embed 未初始化")
+            st = stage_t
+            if st.ndim == 2 and st.shape[1] == 1:
+                st = st.squeeze(1)
+            if st.ndim != 1:
+                raise ValueError(f"stage_t 期望形状 [bs] 或 [bs,1]，实际={tuple(stage_t.shape)}")
+            st = st.to(device if device is not None else gg.device, dtype=torch.long).clamp(min=0, max=self.n_stages)
+            st_tok = self.stage_embed(st)
+            if device is not None:
+                st_tok = st_tok.to(device=device)
+            if dtype is not None:
+                st_tok = st_tok.to(dtype=dtype)
+            xs.append(st_tok)
+
+        if not xs:
+            raise ValueError("Secondary action head received no inputs (check config flags).")
+
+        x = torch.cat(xs, dim=-1)
+        logits = self.secondary_action_head(x)
+        if return_logits:
+            return logits
+        return F.softmax(logits, dim=-1)
+    
+    def compute_td_style_loss(
+        self,
+        td_loss_tot: torch.Tensor,
+        td_losses_i: List[torch.Tensor],
+        lambda_e: float,
+    ) -> torch.Tensor:
+        sum_local_td_losses = sum(td_losses_i)
+        return td_loss_tot + lambda_e * sum_local_td_losses
+
+    def compute_loss(
+        self,
+        z_t: torch.Tensor,          # [bs, K]
+        z_target: torch.Tensor,     # [bs, K]
+        z_mask: torch.Tensor,       # [bs] or [bs,1]
+        *,
+        group_repr: Optional[torch.Tensor] = None,
+        stage_t: Optional[torch.Tensor] = None,
+        extra_cond: Optional[torch.Tensor] = None,
+        loss_type: str = "kl",
+    ) -> torch.Tensor:
+        """
+        belief supervision loss：用 PopulationBeliefUpdateHead 预测 z(t+1)，并用 KL/CE 监督到 target。
+        """
+        z_pred = self.predict_next_population_belief(
+            z_t,
+            group_repr=group_repr,
+            stage_t=stage_t,
+            extra_cond=extra_cond,
+            return_logits=False,
+        )
+        return self.compute_population_belief_loss(z_pred, z_target, z_mask, loss_type=loss_type)
+
+    def compute_population_belief_loss(
+        self,
+        z_pred: torch.Tensor,     # [bs, K] (probs)
+        z_target: torch.Tensor,   # [bs, K] (probs)
+        z_mask: torch.Tensor,     # [bs] or [bs,1]
+        loss_type: str = "kl",
+    ) -> torch.Tensor:
+        """
+        KL/CE supervision loss with mask.
+        - KL: KL(target || pred)
+        - CE: cross entropy with soft target
+        """
+        eps = 1e-8
+        if z_pred.ndim == 1:
+            z_pred = z_pred.unsqueeze(0)
+        if z_target.ndim == 1:
+            z_target = z_target.unsqueeze(0)
+        if z_pred.ndim != 2 or z_target.ndim != 2:
+            raise ValueError(f"z_pred/z_target 期望 [bs,K]，实际 z_pred={tuple(z_pred.shape)} z_target={tuple(z_target.shape)}")
+        if z_pred.size(-1) != z_target.size(-1):
+            raise ValueError(f"z_pred/z_target K 不一致: {z_pred.size(-1)} vs {z_target.size(-1)}")
+
+        if int(z_pred.size(-1)) == 1:
+            if z_mask.ndim == 2 and z_mask.shape[-1] == 1:
+                z_mask = z_mask.squeeze(-1)
+            z_mask = z_mask.to(z_pred.device, dtype=z_pred.dtype)
+
+            z_pred = torch.clamp(z_pred, min=-1.0, max=1.0)
+            z_target = torch.clamp(z_target, min=-1.0, max=1.0)
+            lt = str(loss_type or "mse").lower()
+            if lt in ("smooth_l1", "huber"):
+                per = F.smooth_l1_loss(z_pred, z_target, reduction="none").squeeze(-1)
+            else:
+                per = (z_pred - z_target).pow(2).squeeze(-1)
+            per = per * z_mask
+            return per.sum() / (z_mask.sum() + eps)
+
+        z_pred = torch.clamp(z_pred, min=0.0)
+        z_target = torch.clamp(z_target, min=0.0)
+        z_pred = z_pred / torch.clamp(z_pred.sum(dim=-1, keepdim=True), min=eps)
+        z_target = z_target / torch.clamp(z_target.sum(dim=-1, keepdim=True), min=eps)
+
+        if z_mask.ndim == 2 and z_mask.shape[-1] == 1:
+            z_mask = z_mask.squeeze(-1)
+        z_mask = z_mask.to(z_pred.device, dtype=z_pred.dtype)
+
+        lt = str(loss_type or "kl").lower()
+        if lt == "kl":
+            loss = F.kl_div((z_pred + eps).log(), z_target, reduction="none").sum(dim=-1)
+        else:  # CE (soft target)
+            loss = -(z_target * (z_pred + eps).log()).sum(dim=-1)
+
+        loss = loss * z_mask
+        return loss.sum() / (z_mask.sum() + eps)

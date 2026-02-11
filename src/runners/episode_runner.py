@@ -1,0 +1,1176 @@
+import numpy as np
+import os
+import torch
+from typing import Dict, List, Optional, Tuple, Any
+from envs import REGISTRY as env_REGISTRY
+from functools import partial
+from components.episode_buffer import EpisodeBatch
+from utils.logging import Logger
+from dataclasses import dataclass
+from loguru import logger
+
+@dataclass
+class EpisodeMetrics:
+    """Container for episode-specific metrics."""
+    llm_responses: List[str] = None
+    strategies: List[str] = None
+    commitments: List[str] = None
+    rewards: List[float] = None
+    belief_states: List[torch.Tensor] = None
+    rewards_al: List[float] = None
+    rewards_ts: List[float] = None
+    rewards_cc: List[float] = None
+    
+    def __post_init__(self):
+        """Initialize empty lists."""
+        self.llm_responses = []
+        self.strategies = []
+        self.commitments = []
+        self.rewards = []
+        self.belief_states = []
+        self.rewards_al = []
+        self.rewards_ts = []
+        self.rewards_cc = []
+    
+    def add_step_data(self, extra_info: Dict[str, Any], 
+                      reward: float, reward_al: float, reward_ts: float, reward_cc: float):
+        """Add data from a single step."""
+        if 'llm_responses' in extra_info:
+            rs = extra_info.get("llm_responses")
+            if isinstance(rs, list):
+                self.llm_responses.extend([str(x) for x in rs])
+            elif rs is not None:
+                self.llm_responses.append(str(rs))
+        if 'strategy' in extra_info:
+            st = extra_info.get("strategy")
+            if st is not None:
+                self.strategies.append(str(st))
+        if 'commitment' in extra_info:
+            if isinstance(extra_info['commitment'], str):
+                self.commitments.append(extra_info['commitment'])
+            elif isinstance(extra_info['commitment'], list):
+                self.commitments.extend(extra_info['commitment'])
+
+        if 'belief_states' in extra_info:
+            self.belief_states.append(extra_info['belief_states'])
+        
+        self.rewards.append(reward)
+        self.rewards_al.append(reward_al)
+        self.rewards_ts.append(reward_ts)
+        self.rewards_cc.append(reward_cc)
+
+class EpisodeRunner:
+    """
+    Episode runner for LLM-based MARL training.
+    
+    Handles episode execution, data collection, and coordination between
+    environment interactions, LLM responses, and data storage.
+    """
+    def __init__(self, args: Any, logger: Logger):
+        """
+        Initialize episode runner.
+        
+        Args:
+            args: Configuration arguments
+            logger: Logger instance
+        """
+        self.args = args
+        self.logger = logger
+        
+        self.env = None
+        self.env_info = None
+        self.batch = None
+        
+        self.t = 0  # Current timestep within episode
+        self.t_env = 0  # Total timesteps across all episodes
+        self.t_episodes = 0  # 添加episode计数器
+        
+        self.test_returns = []
+        self.train_returns = []
+        self.last_test_t = 0
+        self.last_save_t = 0
+        
+        self.mac = None
+        self.batch_handler = None
+        
+        self.train_stats = {}
+        self.test_stats = {}
+        self.last_env_infos: List[Dict[str, Any]] = []
+
+        self._forced_align_printed = False
+        self._forced_align_action_n = 0
+        self._forced_align_action_ok = 0
+        self._forced_align_stance_n = 0
+        self._forced_align_stance_ok = 0
+        
+        self.episode_limit = 1  # Single step per episode for LLM environments
+        self.n_agents = args.n_agents
+        self.batch_size = self.args.batch_size_run
+        if self.batch_size != 1:
+            self.logger.warning(
+                f"EpisodeRunner batch_size_run={self.batch_size} (>1). "
+                "Current implementation will broadcast a single env trajectory across batch dimension."
+            )
+        
+        self.env = self._init_environment()
+        self.env_info = self.env.get_env_info()
+        self.episode_limit = self.env_info["episode_limit"]
+        self.obs_shape = self.env_info["obs_shape"]
+        self.t = 0 # Step within the current episode
+        
+        self.new_batch = self._init_batch_handler()
+        self.batch = self.new_batch()
+
+    def setup(self, scheme: Dict, groups: Dict, preprocess: Any, mac: Any):
+        """Setup with MAC."""
+        self.scheme = scheme
+        self.groups = groups
+        self.preprocess = preprocess
+        self.mac = mac  # 添加MAC
+    
+    def _init_environment(self):
+        """Initialize and return the environment from the registry."""
+        try:
+            env_key = self.args.env
+            if hasattr(self.args.env_args, '__dict__'):
+                env_kwargs = vars(self.args.env_args)
+            else:
+                env_kwargs = dict(self.args.env_args)
+
+            def _resolve_rel_path(p: str) -> str:
+                if not isinstance(p, str) or not p:
+                    return p
+                if "${" in p or p.startswith("$"):
+                    return p
+                try:
+                    base = getattr(self.args, "_repo_root", None)
+                    if base:
+                        pp = p
+                        if not os.path.isabs(pp):
+                            cand = os.path.abspath(os.path.join(str(base), pp))
+                            if os.path.exists(cand):
+                                return cand
+                except Exception:
+                    pass
+                return p
+
+            try:
+                if isinstance(env_kwargs.get("label2id_path"), str):
+                    env_kwargs["label2id_path"] = _resolve_rel_path(env_kwargs["label2id_path"])
+                if isinstance(env_kwargs.get("hisim_data_root"), str):
+                    env_kwargs["hisim_data_root"] = _resolve_rel_path(env_kwargs["hisim_data_root"])
+                if "hf_dataset_path" in env_kwargs:
+                    hp = env_kwargs.get("hf_dataset_path")
+                    if isinstance(hp, str):
+                        env_kwargs["hf_dataset_path"] = _resolve_rel_path(hp)
+                    elif isinstance(hp, (list, tuple)):
+                        env_kwargs["hf_dataset_path"] = [_resolve_rel_path(x) for x in hp]
+            except Exception:
+                pass
+            
+            if hasattr(self.args, 'reward'):
+                env_kwargs['reward_config'] = self.args.reward
+            
+            return env_REGISTRY[env_key](**env_kwargs)
+        except KeyError:
+            self.logger.error(f"Environment '{self.args.env}' not found in registry. Available: {list(env_REGISTRY.keys())}")
+            raise
+        except Exception as e:
+            self.logger.error(f"Failed to initialize environment '{self.args.env}': {e}")
+            raise
+    
+    def _init_batch_handler(self):
+        """Initialize and return the batch handler."""
+        return partial(
+            EpisodeBatch,
+            scheme=self._build_scheme(),
+            groups=self._build_groups(),
+            batch_size=self.batch_size,
+            max_seq_length=self.episode_limit + 1,
+            device=self.args.device
+        )
+
+    def set_env_n_stages(self, n_stages: int) -> None:
+        """
+        Update env.n_stages (if supported) and rebuild episode_limit + EpisodeBatch factory.
+        This enables curriculum training without restarting the whole process.
+        """
+        try:
+            ns = int(n_stages)
+        except Exception:
+            return
+        if ns <= 0:
+            return
+        if not hasattr(self.env, "n_stages"):
+            self.logger.warning("Runner curriculum requested but env has no attribute n_stages.")
+            return
+        try:
+            self.env.n_stages = int(ns)
+            if hasattr(self.env, "core_users"):
+                if bool(getattr(self.env, "sync_stage_update", False)):
+                    self.env.episode_limit = int(ns)
+                else:
+                    self.env.episode_limit = int(ns) * len(getattr(self.env, "core_users"))
+        except Exception as e:
+            self.logger.warning(f"Failed to set env.n_stages={ns}: {e}")
+            return
+
+        try:
+            self.env_info = self.env.get_env_info()
+            self.episode_limit = int(self.env_info.get("episode_limit", self.episode_limit))
+            self.new_batch = self._init_batch_handler()
+            self.reset_runner_state()
+            self.logger.info(f"[Curriculum] Updated env n_stages={ns}, episode_limit={self.episode_limit}")
+        except Exception as e:
+            self.logger.warning(f"Failed to refresh runner after setting n_stages={ns}: {e}")
+
+    def run(self, test_mode: bool = False) -> EpisodeBatch:
+        """
+        Run a complete episode (processing one data sample from the dataset).
+        
+        Args:
+            test_mode: Whether in testing mode
+            
+        Returns:
+            Collected episode data for the processed sample.
+        """
+        try:
+            current_obs, env_step_info = self.env.reset() # env_step_info contains the full sample
+            self.reset_runner_state() # Resets self.batch and self.t
+            
+            if current_obs is None: # Should be handled by env.reset() raising StopIteration
+                self.logger.warning("Environment reset returned None observation. Stopping run.")
+                return self.batch # Return empty or partially filled batch
+
+            episode_return = 0
+            if hasattr(self.mac, 'init_hidden'):
+                self.mac.init_hidden(batch_size=self.batch_size)
+            
+            metrics = EpisodeMetrics()
+            
+            terminated = False
+            _next_obs = current_obs
+            self.last_env_infos = []
+
+            while (not terminated) and (self.t < self.episode_limit):
+                pre_transition_data = self._get_pre_transition_data(_next_obs, env_step_info)
+                self.batch.update(pre_transition_data, ts=self.t)
+
+                raw_for_mac = _next_obs if isinstance(_next_obs, str) else None
+                discrete_actions, mac_extra_info = self._get_actions(test_mode, raw_observation_text=raw_for_mac)
+
+                action_source = str(getattr(self.args, "env_action_source", "commitment")).strip().lower()
+                action_for_env_step = ""
+                secondary_z_next_override = None
+                secondary_z_next_source = None
+                try:
+                    if bool(getattr(self.env, "sync_stage_update", False)):
+                        a = discrete_actions
+                        if isinstance(a, torch.Tensor) and a.ndim >= 2:
+                            a0 = a[0]
+                        else:
+                            a0 = a
+
+                        stance_q = mac_extra_info.get("stance_action_q_values")
+                        if isinstance(stance_q, torch.Tensor) and stance_q.ndim >= 3:
+                            stance_q0 = stance_q[0]
+                        elif isinstance(stance_q, torch.Tensor) and stance_q.ndim == 2:
+                            stance_q0 = stance_q
+                        else:
+                            stance_q0 = None
+
+                        at_names = ["post", "retweet", "reply", "like", "do_nothing"]
+                        stance_actions = {"post", "retweet", "reply"}
+                        acts = []
+                        for i in range(int(self.n_agents)):
+                            try:
+                                if isinstance(a0, torch.Tensor):
+                                    aid = int(a0[i].item()) if a0.numel() > i else 4
+                                else:
+                                    aid = int(a0)
+                            except Exception:
+                                aid = 4
+                            aid = int(max(0, min(4, aid)))
+                            at = at_names[aid]
+                            sid = None
+                            if at in stance_actions:
+                                try:
+                                    if isinstance(stance_q0, torch.Tensor) and stance_q0.ndim == 2 and stance_q0.shape[0] > i:
+                                        sid = int(stance_q0[i].argmax(dim=-1).item())
+                                    else:
+                                        sid = 0
+                                except Exception:
+                                    sid = 0
+                            acts.append({"action_type": at, "stance_id": sid, "post_text": ""})
+                        action_for_env_step = acts
+                        action_source = "sync_stage_policy"
+
+                        try:
+                            env_name = str(getattr(self.args, "env", "") or "").strip().lower()
+                            pbm = str(getattr(getattr(self.args, "env_args", None), "population_z_updater", "") or "").strip().lower()
+                            use_sec = bool(getattr(getattr(self.args, "env_args", None), "use_secondary_belief_sim", False))
+                            if env_name == "hisim_social_env" and use_sec and pbm in ("noop", "none", "no_op", "no-op"):
+                                be = getattr(self.mac, "belief_encoder_module", None)
+                                if be is not None and hasattr(be, "predict_next_population_belief"):
+                                    dim = int(getattr(getattr(self.args, "env_args", None), "group_representation_dim", getattr(self.args, "belief_dim", 128)))
+                                    dim = max(8, int(dim))
+                                    v = torch.zeros((dim,), dtype=torch.float32, device=self.args.device)
+                                    at_counts = torch.zeros((5,), dtype=torch.float32, device=self.args.device)
+                                    st_counts = torch.zeros((3,), dtype=torch.float32, device=self.args.device)
+                                    for a in acts:
+                                        try:
+                                            at = str(a.get("action_type") or "").strip().lower()
+                                            sid = a.get("stance_id", None)
+                                        except Exception:
+                                            at = ""
+                                            sid = None
+                                        if at == "post":
+                                            at_counts[0] += 1.0
+                                        elif at == "retweet":
+                                            at_counts[1] += 1.0
+                                        elif at == "reply":
+                                            at_counts[2] += 1.0
+                                        elif at == "like":
+                                            at_counts[3] += 1.0
+                                        else:
+                                            at_counts[4] += 1.0
+                                        if at in stance_actions and sid is not None:
+                                            try:
+                                                si = int(sid)
+                                                if 0 <= si < 3:
+                                                    st_counts[si] += 1.0
+                                            except Exception:
+                                                pass
+                                    st_sum = float(st_counts.sum().item())
+                                    at_sum = float(at_counts.sum().item())
+                                    if st_sum > 0:
+                                        v[:3] = st_counts / st_sum
+                                    if at_sum > 0:
+                                        v[3:8] = at_counts / at_sum
+
+                                    z_t = None
+                                    st_t = None
+                                    try:
+                                        if hasattr(self.batch, "scheme") and "belief_pre_population_z" in self.batch.scheme:
+                                            z_t = self.batch["belief_pre_population_z"][:, self.t]  # (bs, K)
+                                        elif hasattr(self.batch, "scheme") and "z_t" in self.batch.scheme:
+                                            z_t = self.batch["z_t"][:, self.t]
+                                        if hasattr(self.batch, "scheme") and "stage_t" in self.batch.scheme:
+                                            st_t = self.batch["stage_t"][:, self.t]
+                                        if isinstance(st_t, torch.Tensor) and st_t.ndim == 2 and st_t.shape[1] == 1:
+                                            st_t = st_t.squeeze(1)
+                                    except Exception:
+                                        z_t = None
+                                        st_t = None
+                                    if isinstance(z_t, torch.Tensor):
+                                        bs0 = int(z_t.shape[0])
+                                        gr_next = v.view(1, -1).expand(bs0, -1)
+                                        with torch.no_grad():
+                                            secondary_z_next_override = be.predict_next_population_belief(
+                                                z_t,
+                                                group_repr=gr_next,
+                                                stage_t=st_t,
+                                                return_logits=False,
+                                            )
+                                        secondary_z_next_source = "policy_post_stage_group_repr"
+                        except Exception:
+                            secondary_z_next_override = None
+                            secondary_z_next_source = None
+                except Exception:
+                    pass
+                if action_source in ("sync_stage_policy",):
+                    pass
+                elif action_source in ("discrete_action_boxed", "boxed", "discrete"):
+                    try:
+                        a = discrete_actions
+                        s3b_binary_01 = False
+                        try:
+                            if bool(getattr(self.args, "train_action_imitation", False)):
+                                s3b_binary_01 = bool(getattr(self.args, "action_imitation_binary_01", False))
+                        except Exception:
+                            s3b_binary_01 = False
+
+                        if s3b_binary_01:
+                            q = mac_extra_info.get("action_type_q_values")
+                            if isinstance(q, torch.Tensor):
+                                if q.ndim >= 3:
+                                    q0 = q[0, 0, :2]
+                                elif q.ndim == 2:
+                                    q0 = q[0, :2]
+                                else:
+                                    q0 = None
+                                if isinstance(q0, torch.Tensor) and q0.numel() == 2:
+                                    sel = str(getattr(self.args, "s3b_boxed_action_selection", "argmax") or "argmax").strip().lower()
+                                    if sel in ("sample", "sampling", "softmax_sample", "categorical"):
+                                        try:
+                                            temp = float(getattr(self.args, "s3b_boxed_action_temperature", 1.0) or 1.0)
+                                        except Exception:
+                                            temp = 1.0
+                                        temp = float(max(1e-6, temp))
+                                        try:
+                                            eps = float(getattr(self.args, "s3b_boxed_action_epsilon", 0.0) or 0.0)
+                                        except Exception:
+                                            eps = 0.0
+                                        eps = float(max(0.0, min(1.0, eps)))
+                                        logits = (q0.float() / temp).view(1, 2)
+                                        p = torch.softmax(logits, dim=-1).view(-1)
+                                        if eps > 0:
+                                            p = (1.0 - eps) * p + eps * torch.full_like(p, 0.5)
+                                        p = torch.clamp(p, min=1e-12)
+                                        p = p / p.sum()
+                                        aid = int(torch.multinomial(p, num_samples=1).item())
+                                    else:
+                                        aid = int(q0.argmax(dim=-1).item())
+                                else:
+                                    aid = 0
+                            else:
+                                aid = 0
+                        else:
+                            if isinstance(a, torch.Tensor):
+                                if a.ndim >= 2:
+                                    a0 = a[0]
+                                else:
+                                    a0 = a
+                                aid = int(a0[0].item()) if a0.numel() > 0 else 0
+                            else:
+                                aid = int(a)
+                    except Exception:
+                        aid = 0
+                    action_for_env_step = f"\\boxed{{{aid}}}"
+                elif action_source in ("llm_response_0", "executor0", "executor_0", "response0"):
+                    rs = mac_extra_info.get("llm_responses") or []
+                    action_for_env_step = rs[0] if isinstance(rs, list) and len(rs) > 0 else ""
+                else:
+                    action_for_env_step = mac_extra_info.get("commitment_text", "")
+                    if not action_for_env_step and mac_extra_info.get("llm_responses"):
+                        action_for_env_step = mac_extra_info["llm_responses"][0] if mac_extra_info["llm_responses"] else ""
+
+                step_extra_info = {
+                    "agent_responses": mac_extra_info.get("llm_responses", []),
+                    "commitment_text": mac_extra_info.get("commitment_text", ""),
+                    "agent_log_probs": mac_extra_info.get("agent_log_probs"),
+                    "prompt_embeddings": mac_extra_info.get("prompt_embeddings"),
+                    "belief_states": mac_extra_info.get("belief_states"),
+                    "secondary_z_next": secondary_z_next_override if secondary_z_next_override is not None else mac_extra_info.get("secondary_z_next"),
+                    "secondary_z_next_source": secondary_z_next_source,
+                    "secondary_action_probs": mac_extra_info.get("secondary_action_probs"),
+                }
+
+                _next_obs, reward_total_float, terminated, _truncated, env_step_info = self.env.step(
+                    action_for_env_step, extra_info=step_extra_info
+                )
+                try:
+                    if isinstance(env_step_info, dict):
+                        q = mac_extra_info.get("action_type_q_values")
+                        q0 = None
+                        if isinstance(q, torch.Tensor):
+                            if q.ndim >= 3:
+                                q0 = q[0, 0, :2]
+                            elif q.ndim == 2:
+                                q0 = q[0, :2]
+                        if isinstance(q0, torch.Tensor) and q0.numel() == 2:
+                            bias_logit = float((q0[1] - q0[0]).item())
+                            p = torch.softmax(q0.float(), dim=-1)
+                            p0 = float(p[0].item())
+                            p1 = float(p[1].item())
+                            env_step_info["pref_bias_logit"] = bias_logit
+                            env_step_info["pref_p0"] = p0
+                            env_step_info["pref_p1"] = p1
+                except Exception:
+                    pass
+                if isinstance(env_step_info, dict):
+                    self.last_env_infos.append(env_step_info)
+
+                try:
+                    dbg = bool(getattr(getattr(self.args, "system", None), "debug", False))
+                    env_name = str(getattr(self.args, "env", "") or "").strip().lower()
+                    if dbg and (not self._forced_align_printed) and env_name == "hisim_social_env":
+                        f_at = None
+                        f_sid = None
+                        try:
+                            fat_list = mac_extra_info.get("forced_action_types")
+                            fsid_list = mac_extra_info.get("forced_stance_ids")
+                            if isinstance(fat_list, list) and len(fat_list) > 0:
+                                f_at = str(fat_list[0])
+                            if isinstance(fsid_list, list) and len(fsid_list) > 0:
+                                f_sid = fsid_list[0]
+                        except Exception:
+                            f_at = None
+                            f_sid = None
+
+                        parsed_at = env_step_info.get("action_type") if isinstance(env_step_info, dict) else None
+                        parsed_sid = env_step_info.get("pred_stance_id") if isinstance(env_step_info, dict) else None
+
+                        if f_at is not None and parsed_at is not None:
+                            self._forced_align_action_n += 1
+                            if str(f_at) == str(parsed_at):
+                                self._forced_align_action_ok += 1
+
+                        stance_actions = {"post", "retweet", "reply"}
+                        if f_at is not None and str(f_at) in stance_actions and (f_sid is not None) and (parsed_sid is not None):
+                            self._forced_align_stance_n += 1
+                            try:
+                                if int(f_sid) == int(parsed_sid):
+                                    self._forced_align_stance_ok += 1
+                            except Exception:
+                                pass
+
+                        thr = int(getattr(self.args, "forced_align_log_after", 50))
+                        thr = max(1, thr)
+                        if (self._forced_align_action_n >= thr) or bool(terminated):
+                            ar = self._forced_align_action_ok / float(max(1, self._forced_align_action_n))
+                            sr = self._forced_align_stance_ok / float(max(1, self._forced_align_stance_n)) if self._forced_align_stance_n > 0 else float("nan")
+                            sr_str = f"{sr:.3f}" if (sr == sr) else "nan"
+                            self.logger.info(
+                                f"[Debug][forced-align] action_type align: {self._forced_align_action_ok}/{self._forced_align_action_n}={ar:.3f} | "
+                                f"stance_id align (stance-actions only): {self._forced_align_stance_ok}/{self._forced_align_stance_n}={sr_str}"
+                            )
+                            self._forced_align_printed = True
+                except Exception:
+                    pass
+
+                # Normalize reward component names across envs.
+                # - HiSimSocialEnv reports: reward_action_type / reward_ts(stance) / reward_text
+                # - HuggingFaceDatasetEnv (math) may report: reward_al / reward_ts / reward_cc
+                reward_ts = env_step_info.get("reward_ts", env_step_info.get("reward_stance", 0.0))
+                reward_al = env_step_info.get("reward_al", env_step_info.get("reward_action_type", 0.0))
+                reward_cc = env_step_info.get("reward_cc", env_step_info.get("reward_text", 0.0))
+
+                rewards_al_list = [reward_al] * self.n_agents
+                rewards_ts_list = [reward_ts] * self.n_agents
+                rewards_cc_list = [reward_cc] * self.n_agents
+
+                episode_return += reward_total_float
+                metrics.add_step_data(mac_extra_info, reward_total_float, reward_al, reward_ts, reward_cc)
+
+                actions_for_batch_storage = discrete_actions[0] if discrete_actions.ndim > 1 else discrete_actions
+                current_commitment_embedding = mac_extra_info.get("commitment_embedding")
+                current_q_values = mac_extra_info.get("q_values")
+                current_agent_prompt_embeddings = mac_extra_info.get("prompt_embeddings")
+                current_group_representation = mac_extra_info.get("group_repr")
+                current_belief_states = mac_extra_info.get("belief_states")
+
+                post_data = self._get_post_transition_data(
+                    actions_for_batch_storage,
+                    reward_total_float,
+                    terminated,
+                    env_step_info,
+                    rewards_al_list,
+                    rewards_ts_list,
+                    rewards_cc_list,
+                    current_commitment_embedding,
+                    current_q_values,
+                    current_agent_prompt_embeddings,
+                    current_group_representation,
+                    current_belief_states,
+                )
+                self.batch.update(post_data, ts=self.t)
+                self.t += 1
+                try:
+                    self.t_env += 1
+                except Exception:
+                    self.t_env = int(getattr(self, "t_env", 0)) + 1
+                try:
+                    sel = getattr(getattr(self.mac, "action_selector", None), "epsilon_decay", None)
+                    if callable(sel):
+                        sel(int(self.t_env))
+                except Exception:
+                    pass
+
+            if not test_mode:
+                self._handle_episode_end(metrics, episode_return, test_mode)
+                self.t_episodes += 1
+
+            if self.episode_limit > 0:
+                self._add_final_data(_next_obs if not test_mode else current_obs)
+
+            if not test_mode:
+                self._add_llm_data_to_batch(metrics)
+
+            return self.batch
+            
+        except StopIteration: # Raised by self.env.reset() if dataset is exhausted
+            self.logger.info(f"Dataset exhausted after {self.t_env} samples.")
+            return self.batch # Or None, or raise further to signal completion
+        except Exception as e:
+            logger.error(f"Error during episode execution: {str(e)}")
+            logger.exception("Exception details:")
+            raise
+
+    def _get_pre_transition_data(self, current_observation_text: Any, env_reset_or_step_info: Optional[Dict[str, Any]] = None) -> Dict:
+        """
+        Get pre-transition data (current observation). Supports str or list[str] (per-agent).
+        Best-effort injects global conditioning fields from env.reset()/env.step() info so they're available at t=0
+        (e.g., stage_t / z_t / belief_pre_* / group_representation).
+        """
+        default_state_vshape = self.env_info.get("state_shape", (1,))
+        default_avail_actions_vshape = (self.env_info.get("n_actions", 1),)
+
+        if isinstance(current_observation_text, (list, tuple)):
+            obs_list = [str(x) for x in list(current_observation_text)]
+            if len(obs_list) < self.n_agents:
+                obs_list = obs_list + ["" for _ in range(self.n_agents - len(obs_list))]
+            if len(obs_list) > self.n_agents:
+                obs_list = obs_list[: self.n_agents]
+            obs_tensors = [self.mac.preprocess_observation(s) for s in obs_list]
+            obs_field = obs_tensors
+        else:
+            obs_tensor = self.mac.preprocess_observation(str(current_observation_text))
+            obs_field = [obs_tensor for _ in range(self.n_agents)]
+
+        pre_data: Dict[str, Any] = {
+            "obs": obs_field,
+            "state": [torch.zeros(*default_state_vshape, device=self.args.device)], 
+            "avail_actions": [
+                torch.ones(*default_avail_actions_vshape, device=self.args.device, dtype=torch.int64) for _ in range(self.n_agents)
+            ],
+        }
+
+        try:
+            info0 = env_reset_or_step_info if isinstance(env_reset_or_step_info, dict) else {}
+            sample = info0.get("sample") if isinstance(info0.get("sample", None), dict) else None
+            if sample is None:
+                sample = info0 if isinstance(info0, dict) else {}
+
+            st = None
+            try:
+                bi0 = sample.get("belief_inputs", None)
+                if isinstance(bi0, dict) and ("t" in bi0):
+                    st = bi0.get("t")
+            except Exception:
+                st = None
+            if st is None:
+                try:
+                    bi1 = sample.get("belief_inputs_post", None)
+                    if isinstance(bi1, dict) and ("t" in bi1):
+                        st = bi1.get("t")
+                except Exception:
+                    st = None
+            if st is None:
+                st = sample.get("stage_t", sample.get("t", None))
+            if st is not None:
+                try:
+                    pre_data["stage_t"] = torch.tensor([int(st)], dtype=torch.int64, device=self.args.device)
+                except Exception:
+                    pass
+
+            gr = sample.get("group_representation_next", None)
+            if gr is None:
+                gr = sample.get("group_representation", None)
+            if gr is not None:
+                try:
+                    if isinstance(gr, torch.Tensor):
+                        gv = gr.detach().float().view(-1).to(self.args.device)
+                    elif isinstance(gr, (list, tuple)):
+                        gv = torch.tensor([float(x) for x in list(gr)], dtype=torch.float32, device=self.args.device)
+                    else:
+                        gv = None
+                    if isinstance(gv, torch.Tensor) and gv.numel() > 0:
+                        pre_data["group_representation"] = gv
+                except Exception:
+                    pass
+
+            get_bt = getattr(self.env, "get_belief_tensor", None)
+            if callable(get_bt):
+                bi = sample.get("belief_inputs", None)
+                if not isinstance(bi, dict):
+                    bi = sample.get("belief_inputs_post", None)
+                if not isinstance(bi, dict):
+                    if "z_t" in sample:
+                        bi = {
+                            "population_z": sample.get("z_t"),
+                            "is_core_user": bool(sample.get("is_core_user", False)),
+                            "neighbor_stance_counts": [0, 0, 0],
+                        }
+                bt_pre = get_bt(bi, device=self.args.device) if bi is not None else None
+                if isinstance(bt_pre, dict):
+                    if "population_z" in bt_pre:
+                        pre_data["belief_pre_population_z"] = bt_pre["population_z"].to(self.args.device)
+                        pre_data["z_t"] = bt_pre["population_z"].to(self.args.device)
+                    if "neighbor_stance_counts" in bt_pre:
+                        pre_data["belief_pre_neighbor_counts"] = bt_pre["neighbor_stance_counts"].to(self.args.device)
+                    if "is_core_user" in bt_pre:
+                        pre_data["belief_pre_is_core_user"] = bt_pre["is_core_user"].to(self.args.device)
+
+            try:
+                mode = str(getattr(self.args, "z_ablation_mode", "none") or "none").strip().lower()
+            except Exception:
+                mode = "none"
+            if mode not in ("none", "off", "0", "false", "") and ("z_t" in pre_data):
+                z = pre_data.get("z_t")
+                if isinstance(z, torch.Tensor):
+                    if not hasattr(self, "_z_shuffle_pool"):
+                        self._z_shuffle_pool = []
+                    if mode in ("zero", "zeros"):
+                        pre_data["z_t"] = torch.zeros_like(z)
+                        pre_data["belief_pre_population_z"] = torch.zeros_like(z) if "belief_pre_population_z" in pre_data else pre_data.get("belief_pre_population_z", z)
+                    elif mode in ("shuffle", "shuffled"):
+                        if len(self._z_shuffle_pool) >= 1:
+                            try:
+                                seed0 = int(getattr(self.args, "z_shuffle_seed", 0) or 0)
+                                rnd = np.random.RandomState(seed0 + int(getattr(self, "t_env", 0)))
+                                j = int(rnd.randint(0, len(self._z_shuffle_pool)))
+                            except Exception:
+                                j = int(np.random.randint(0, len(self._z_shuffle_pool)))
+                            z2 = self._z_shuffle_pool[j]
+                            if isinstance(z2, torch.Tensor) and (z2.shape == z.shape):
+                                pre_data["z_t"] = z2.to(self.args.device)
+                                if "belief_pre_population_z" in pre_data and isinstance(pre_data["belief_pre_population_z"], torch.Tensor):
+                                    pre_data["belief_pre_population_z"] = z2.to(self.args.device)
+                        try:
+                            self._z_shuffle_pool.append(z.detach().float().cpu().view_as(z))
+                            if len(self._z_shuffle_pool) > 4096:
+                                self._z_shuffle_pool = self._z_shuffle_pool[-2048:]
+                        except Exception:
+                            pass
+        except Exception as e:
+            self.logger.debug(f"Failed to inject pre-transition conditioning fields: {e}")
+
+        return pre_data
+
+    def _get_actions(self, test_mode: bool, raw_observation_text: Optional[str] = None) -> Tuple[torch.Tensor, Dict]:
+        """Get actions and extra info from MAC."""
+        return self.mac.select_actions(
+            self.batch, # Pass the current episode batch (contains tokenized obs at ts=0)
+            t_ep=self.t,  # Current step in the episode (0)
+            t_env=self.t_env, # Global step counter
+            raw_observation_text=raw_observation_text, # Pass raw text for LLM prompts
+            test_mode=test_mode
+        )
+
+    def _get_post_transition_data(self, discrete_actions_for_agents: torch.Tensor, 
+                                reward_total: float,  
+                                terminated: bool, env_info: Dict,
+                                rewards_al: List[float], 
+                                rewards_ts: List[float], 
+                                rewards_cc: List[float],
+                                commitment_embedding: Optional[torch.Tensor],
+                                q_values_per_agent: Optional[torch.Tensor], # New: (n_agents, 1)
+                                prompt_embeddings_per_agent: Optional[torch.Tensor], # New: (n_agents, 2)
+                                group_representation: Optional[torch.Tensor],
+                                belief_states: Optional[torch.Tensor]
+                                ) -> Dict:
+        """Get post-transition data."""
+        
+
+        final_reward_scalar = torch.tensor([reward_total], dtype=torch.float32, device=self.args.device)  # (1,)
+        
+        rewards_al_tensor = torch.tensor(rewards_al, dtype=torch.float32, device=self.args.device).view(self.n_agents, 1)
+        rewards_ts_tensor = torch.tensor(rewards_ts, dtype=torch.float32, device=self.args.device).view(self.n_agents, 1)
+        rewards_cc_tensor = torch.tensor(rewards_cc, dtype=torch.float32, device=self.args.device).view(self.n_agents, 1)
+
+        if discrete_actions_for_agents.ndim == 1:
+             actions_for_batch = discrete_actions_for_agents.view(self.n_agents, 1)
+        else:
+             actions_for_batch = discrete_actions_for_agents
+        actions_for_batch = actions_for_batch.to(device=self.args.device, dtype=torch.long)
+
+        post_data_dict = {
+            "actions": actions_for_batch, 
+            "reward": final_reward_scalar, 
+            "terminated": torch.tensor([terminated], dtype=torch.uint8, device=self.args.device),
+            "reward_al": rewards_al_tensor,
+            "reward_ts": rewards_ts_tensor,
+            "reward_cc": rewards_cc_tensor,
+            "filled": torch.tensor([1], dtype=torch.long, device=self.args.device)
+        }
+
+        try:
+            import re
+
+            def _parse_boxed_int(s: Any) -> Optional[int]:
+                if not isinstance(s, str):
+                    return None
+                m = re.search(r"\\boxed\{\s*([-+]?\d+)\s*\}", s)
+                if not m:
+                    m = re.search(r"boxed\{\s*([-+]?\d+)\s*\}", s)
+                return int(m.group(1)) if m else None
+
+            gt = None
+            if isinstance(env_info, dict):
+                gt = _parse_boxed_int(env_info.get("ground_truth_answer"))
+                if gt is None:
+                    gt = _parse_boxed_int(env_info.get("ground_truth"))
+                if gt is None:
+                    v = env_info.get("gt_stance_id")
+                    if isinstance(v, int):
+                        gt = int(v)
+            if gt is not None:
+                post_data_dict["gt_action"] = torch.tensor([gt], dtype=torch.int64, device=self.args.device)
+        except Exception as e:
+            self.logger.debug(f"Failed to parse gt_action from env_info: {e}")
+
+        try:
+            am = None
+            if isinstance(env_info, dict):
+                am = env_info.get("action_mask")
+            if am is None:
+                am = 1.0
+            post_data_dict["action_mask"] = torch.tensor([float(am)], dtype=torch.float32, device=self.args.device)
+        except Exception:
+            post_data_dict["action_mask"] = torch.tensor([1.0], dtype=torch.float32, device=self.args.device)
+
+        try:
+            if isinstance(env_info, dict) and "target_distribution_prob" in env_info:
+                na = int(self.env_info.get("n_actions", 1))
+                na = max(1, na)
+                dist = env_info.get("target_distribution_prob")
+                arr = [0.0 for _ in range(na)]
+                if isinstance(dist, dict):
+                    for k, v in dist.items():
+                        try:
+                            idx = int(k)
+                            if 0 <= idx < na:
+                                arr[idx] = float(v)
+                        except Exception:
+                            continue
+                elif isinstance(dist, (list, tuple)):
+                    for i, x in enumerate(list(dist)[:na]):
+                        try:
+                            arr[i] = float(x)
+                        except Exception:
+                            arr[i] = 0.0
+                post_data_dict["gt_action_dist"] = torch.tensor(arr, dtype=torch.float32, device=self.args.device)
+        except Exception as e:
+            self.logger.debug(f"Failed to parse gt_action_dist from env_info: {e}")
+
+        try:
+            if isinstance(env_info, dict):
+                if "t" in env_info:
+                    post_data_dict["stage_t"] = torch.tensor([int(env_info.get("t", 0))], dtype=torch.int64, device=self.args.device)
+
+                get_bt = getattr(self.env, "get_belief_tensor", None)
+                if callable(get_bt):
+                    bi_pre = env_info.get("belief_inputs_pre")
+                    bt_pre = get_bt(bi_pre, device=self.args.device) if bi_pre is not None else None
+                    if isinstance(bt_pre, dict):
+                        if "population_z" in bt_pre:
+                            post_data_dict["belief_pre_population_z"] = bt_pre["population_z"].to(self.args.device)
+                            post_data_dict["z_t"] = bt_pre["population_z"].to(self.args.device)
+                        if "neighbor_stance_counts" in bt_pre:
+                            post_data_dict["belief_pre_neighbor_counts"] = bt_pre["neighbor_stance_counts"].to(self.args.device)
+                        if "is_core_user" in bt_pre:
+                            post_data_dict["belief_pre_is_core_user"] = bt_pre["is_core_user"].to(self.args.device)
+
+                    bi_post = env_info.get("belief_inputs_post")
+                    bt_post = get_bt(bi_post, device=self.args.device) if bi_post is not None else None
+                    if isinstance(bt_post, dict):
+                        if "population_z" in bt_post:
+                            post_data_dict["belief_post_population_z"] = bt_post["population_z"].to(self.args.device)
+                        if "neighbor_stance_counts" in bt_post:
+                            post_data_dict["belief_post_neighbor_counts"] = bt_post["neighbor_stance_counts"].to(self.args.device)
+                        if "is_core_user" in bt_post:
+                            post_data_dict["belief_post_is_core_user"] = bt_post["is_core_user"].to(self.args.device)
+        except Exception as e:
+            self.logger.warning(f"Failed to add belief tensor fields to batch: {e}")
+
+        try:
+            if isinstance(env_info, dict) and ("z_pred" in env_info or "z_target" in env_info or "z_mask" in env_info):
+                z_pred = env_info.get("z_pred")
+                z_target = env_info.get("z_target")
+                z_mask = env_info.get("z_mask", 0.0)
+                if isinstance(z_pred, list):
+                    post_data_dict["z_pred"] = torch.tensor(z_pred, dtype=torch.float32, device=self.args.device)
+                if isinstance(z_target, list):
+                    post_data_dict["z_target"] = torch.tensor(z_target, dtype=torch.float32, device=self.args.device)
+                post_data_dict["z_mask"] = torch.tensor([float(z_mask)], dtype=torch.float32, device=self.args.device)
+                try:
+                    a0 = env_info.get("z_alpha0_target", None)
+                    if a0 is not None:
+                        post_data_dict["z_alpha0_target"] = torch.tensor([float(a0)], dtype=torch.float32, device=self.args.device)
+                except Exception:
+                    pass
+        except Exception as e:
+            self.logger.warning(f"Failed to add z supervision fields to batch: {e}")
+
+        try:
+            if isinstance(env_info, dict):
+                if "core_stance_id_t" in env_info:
+                    post_data_dict["core_stance_id_t"] = torch.tensor([int(env_info.get("core_stance_id_t", -1))], dtype=torch.int64, device=self.args.device)
+                if "core_action_type_id_t" in env_info:
+                    post_data_dict["core_action_type_id_t"] = torch.tensor([int(env_info.get("core_action_type_id_t", -1))], dtype=torch.int64, device=self.args.device)
+                if "has_user_history" in env_info:
+                    post_data_dict["has_user_history"] = torch.tensor([int(env_info.get("has_user_history", 0))], dtype=torch.int64, device=self.args.device)
+                if "has_neighbors" in env_info:
+                    post_data_dict["has_neighbors"] = torch.tensor([int(env_info.get("has_neighbors", 0))], dtype=torch.int64, device=self.args.device)
+                if "neighbor_action_type_counts_t" in env_info:
+                    v = env_info.get("neighbor_action_type_counts_t")
+                    if isinstance(v, dict):
+                        order = ["post", "retweet", "reply", "like", "do_nothing"]
+                        arr = [float(v.get(k, 0.0)) for k in order]
+                    elif isinstance(v, (list, tuple)):
+                        arr = [float(x) for x in list(v)[:5]]
+                        if len(arr) < 5:
+                            arr = arr + [0.0] * (5 - len(arr))
+                    else:
+                        arr = [0.0, 0.0, 0.0, 0.0, 0.0]
+                    post_data_dict["neighbor_action_type_counts_t"] = torch.tensor(arr, dtype=torch.float32, device=self.args.device)
+                if "neighbor_stance_counts_t" in env_info:
+                    v = env_info.get("neighbor_stance_counts_t")
+                    if isinstance(v, dict):
+                        order = ["Neutral", "Oppose", "Support"]
+                        arr = [float(v.get(k, 0.0)) for k in order]
+                    elif isinstance(v, (list, tuple)):
+                        arr = [float(x) for x in list(v)[:3]]
+                        if len(arr) < 3:
+                            arr = arr + [0.0] * (3 - len(arr))
+                    else:
+                        arr = [0.0, 0.0, 0.0]
+                    post_data_dict["neighbor_stance_counts_t"] = torch.tensor(arr, dtype=torch.float32, device=self.args.device)
+        except Exception as e:
+            self.logger.debug(f"Failed to add structured conditioning fields to batch: {e}")
+
+        if commitment_embedding is not None:
+            if commitment_embedding.ndim == 1: 
+                processed_commitment_embedding = commitment_embedding.unsqueeze(0).to(self.args.device)
+            elif commitment_embedding.ndim == 2 and commitment_embedding.shape[0] == 1: # Already (1, embed_dim)
+                processed_commitment_embedding = commitment_embedding.to(self.args.device)
+            else:
+                self.logger.warning(f"Unexpected commitment_embedding shape from MAC: {commitment_embedding.shape}. Expected (embed_dim,) or (1, embed_dim). Not adding to batch.")
+                processed_commitment_embedding = None 
+            
+            if processed_commitment_embedding is not None:
+                 post_data_dict["commitment_embedding"] = processed_commitment_embedding
+        
+        if q_values_per_agent is not None:  # expected (n_agents,1); accept common variants and normalize
+            try:
+                qv = q_values_per_agent
+                if isinstance(qv, torch.Tensor):
+                    if qv.ndim == 1 and qv.shape[0] == self.n_agents:
+                        qv = qv.view(self.n_agents, 1)
+                    elif qv.ndim == 2:
+                        if qv.shape == (self.n_agents, 1):
+                            pass
+                        elif qv.shape == (1, self.n_agents):
+                            qv = qv.view(self.n_agents, 1)
+                        elif qv.shape[0] == 1 and qv.shape[1] == self.n_agents:
+                            qv = qv.view(self.n_agents, 1)
+                        else:
+                            if qv.shape[0] == 1 and qv.shape[1] == self.n_agents:
+                                qv = qv.squeeze(0).view(self.n_agents, 1)
+                    elif qv.ndim == 3 and qv.shape == (1, self.n_agents, 1):
+                        qv = qv.squeeze(0)
+
+                    if isinstance(qv, torch.Tensor) and qv.shape == (self.n_agents, 1):
+                        post_data_dict["q_values"] = qv.to(self.args.device)
+                    else:
+                        self.logger.warning(
+                            f"Unexpected q_values_per_agent shape: {getattr(q_values_per_agent, 'shape', None)} "
+                            f"(normalized={getattr(qv, 'shape', None)}). Expected ({self.n_agents}, 1). Not adding to batch."
+                        )
+                else:
+                    self.logger.warning(f"Unexpected q_values_per_agent type: {type(q_values_per_agent)}. Not adding to batch.")
+            except Exception as e:
+                self.logger.warning(f"Failed to normalize q_values_per_agent: {e}")
+
+        if prompt_embeddings_per_agent is not None: # Expected shape (n_agents, 2) or (1, n_agents, 2)
+            if prompt_embeddings_per_agent.shape == (self.n_agents, 2):
+                post_data_dict["prompt_embeddings"] = prompt_embeddings_per_agent.to(self.args.device) # Shape: (n_agents, 2)
+            elif prompt_embeddings_per_agent.shape == (1, self.n_agents, 2):
+                post_data_dict["prompt_embeddings"] = prompt_embeddings_per_agent.squeeze(0).to(self.args.device) # Remove batch dim: (n_agents, 2)
+            else:
+                self.logger.warning(f"Unexpected prompt_embeddings_per_agent shape: {prompt_embeddings_per_agent.shape}. Expected ({self.n_agents}, 2) or (1, {self.n_agents}, 2). Not adding to batch.")
+
+        if group_representation is not None:
+            if group_representation.ndim == 1: 
+                processed_group_representation = group_representation.to(self.args.device) # Shape: (embed_dim,)
+            elif group_representation.ndim == 2 and group_representation.shape[0] == 1: # Shape: (1, embed_dim)
+                processed_group_representation = group_representation.squeeze(0).to(self.args.device) # Remove batch dim: (embed_dim,)
+            else:
+                self.logger.warning(f"Unexpected group_representation shape from MAC: {group_representation.shape}. Expected (embed_dim,) or (1, embed_dim). Not adding to batch.")
+                processed_group_representation = None 
+            
+            if processed_group_representation is not None:
+                 post_data_dict["group_representation"] = processed_group_representation.detach().clone()
+        
+        if belief_states is not None:
+            expected_belief_dim = getattr(self.args, 'belief_dim', 64) # Get belief_dim from args, with a fallback
+            if belief_states.shape == (self.n_agents, expected_belief_dim):
+                post_data_dict["belief_states"] = belief_states.to(self.args.device) # Shape: (n_agents, belief_dim)
+            elif belief_states.shape == (1, self.n_agents, expected_belief_dim):
+                post_data_dict["belief_states"] = belief_states.squeeze(0).to(self.args.device) # Remove batch dim: (n_agents, belief_dim)
+            else:
+                self.logger.warning(f"Unexpected belief_states shape: {belief_states.shape}. Expected ({self.n_agents}, {expected_belief_dim}) or (1, {self.n_agents}, {expected_belief_dim}). Not adding to batch.")
+
+        return post_data_dict
+
+    def _handle_episode_end(self, metrics: EpisodeMetrics, 
+                          episode_return: float, test_mode: bool):
+        """Handle end of episode processing."""
+        self._save_episode_metrics(metrics, test_mode)
+        
+        if test_mode:
+            self.test_returns.append(episode_return)
+            self.logger.log_stat("test_return", episode_return, self.t_env)
+        else:
+            self.train_returns.append(episode_return)
+            self.logger.log_stat("train_return", episode_return, self.t_env)
+
+    def _add_final_data(self, next_observation_text: Any):
+        """
+        Add final (next) observations to batch at self.t (t == episode_limit).
+
+        NOTE:
+        - For HiSimSocialEnv in sync-stage mode, observation can be list[str] (per-agent prompts).
+        - At termination, some envs may return empty list/None as next_obs.
+        Tokenizers expect a string (or non-empty batch), so we must sanitize here.
+        """
+        safe_text = ""
+        try:
+            if isinstance(next_observation_text, (list, tuple)):
+                if len(next_observation_text) > 0:
+                    safe_text = str(next_observation_text[0])
+                else:
+                    safe_text = ""
+            elif next_observation_text is None:
+                safe_text = ""
+            else:
+                safe_text = str(next_observation_text)
+        except Exception:
+            safe_text = ""
+        next_obs_tensor = self.mac.preprocess_observation(safe_text)
+
+        default_state_vshape = self.env_info.get("state_shape", (1,))
+        default_avail_actions_vshape = (self.env_info.get("n_actions", 1),)
+
+        last_data = {
+            "obs": [next_obs_tensor for _ in range(self.n_agents)],
+            "state": [torch.zeros(*default_state_vshape, device=self.args.device)], 
+            "avail_actions": [torch.ones(*default_avail_actions_vshape, device=self.args.device, dtype=torch.int64) for _ in range(self.n_agents)],
+            "filled": torch.tensor([0], dtype=torch.long, device=self.args.device)  # 最终状态标记为无效
+        }
+        self.batch.update(last_data, ts=self.t) # self.t is 1 here
+
+    def reset_runner_state(self):
+        """Reset runner's per-episode state (batch and timestep t)."""
+        self.batch = self.new_batch() # Get a fresh batch from the handler
+        self.t = 0 # Reset episode timestep
+
+    def _build_scheme(self) -> Dict:
+        """
+        Build data scheme for episode batch.
+        
+        Returns:
+            Data scheme dictionary
+        """
+        commitment_dim = getattr(self.args, 'commitment_embedding_dim', 768)
+        belief_dim = getattr(self.args, 'belief_dim')
+        pop_dim = int(getattr(self.args, "population_belief_dim", 3))
+        pop_dim = max(1, pop_dim)
+        max_token_len = getattr(self.args.env_args, "max_question_length", 512)
+
+        scheme = {
+            "state": {"vshape": self.env_info["state_shape"]}, # Usually (1,) for these envs
+            "obs": {"vshape": (max_token_len,), "group": "agents", "dtype": torch.long},
+            "actions": {"vshape": (1,), "group": "agents", "dtype": torch.long}, # Symbolic actions
+            "avail_actions": {
+                "vshape": (self.env_info["n_actions"],), # n_actions usually 1
+                "group": "agents",
+                "dtype": torch.int64, # Changed from torch.int for consistency
+            },
+            "reward": {"vshape": (1,)}, # Global reward, will be unsqueezed by buffer if group="agents"
+            "terminated": {"vshape": (1,), "dtype": torch.uint8},
+            "filled": {"vshape": (1,), "dtype": torch.long},  # 添加filled字段，标记有效的时间步
+            
+            "q_values": {"vshape": (1,), "group": "agents", "dtype": torch.float32}, 
+            "prompt_embeddings": {"vshape": (2,), "group": "agents", "dtype": torch.float32}, 
+            "belief_states": {"vshape": (belief_dim,), "group": "agents"},
+            "reward_al": {"vshape": (1,), "group": "agents", "dtype": torch.float32},
+            "reward_ts": {"vshape": (1,), "group": "agents", "dtype": torch.float32},
+            "reward_cc": {"vshape": (1,), "group": "agents", "dtype": torch.float32},
+
+            "commitment_embedding": {"vshape": (commitment_dim,), "dtype": torch.float32},
+            "group_representation": {"vshape": (belief_dim,), "dtype": torch.float32}
+            ,
+            "gt_action": {"vshape": (1,), "dtype": torch.int64},
+            "action_mask": {"vshape": (1,), "dtype": torch.float32},
+            "gt_action_dist": {"vshape": (self.env_info.get("n_actions", 1),), "dtype": torch.float32},
+            "z_pred": {"vshape": (pop_dim,), "dtype": torch.float32},
+            "z_target": {"vshape": (pop_dim,), "dtype": torch.float32},
+            "z_mask": {"vshape": (1,), "dtype": torch.float32},
+            "z_alpha0_target": {"vshape": (1,), "dtype": torch.float32},
+
+            "stage_t": {"vshape": (1,), "dtype": torch.int64},
+            "z_t": {"vshape": (pop_dim,), "dtype": torch.float32},
+            "belief_pre_population_z": {"vshape": (pop_dim,), "dtype": torch.float32},
+            "belief_pre_neighbor_counts": {"vshape": (3,), "dtype": torch.float32},
+            "belief_pre_is_core_user": {"vshape": (1,), "dtype": torch.int64},
+            "belief_post_population_z": {"vshape": (pop_dim,), "dtype": torch.float32},
+            "belief_post_neighbor_counts": {"vshape": (3,), "dtype": torch.float32},
+            "belief_post_is_core_user": {"vshape": (1,), "dtype": torch.int64},
+            "core_stance_id_t": {"vshape": (1,), "dtype": torch.int64},
+            "core_action_type_id_t": {"vshape": (1,), "dtype": torch.int64},
+            "has_user_history": {"vshape": (1,), "dtype": torch.int64},
+            "has_neighbors": {"vshape": (1,), "dtype": torch.int64},
+            "neighbor_action_type_counts_t": {"vshape": (5,), "dtype": torch.float32},
+            "neighbor_stance_counts_t": {"vshape": (3,), "dtype": torch.float32},
+        }
+        return scheme
+
+    def _build_groups(self) -> Dict:
+        """
+        Build groups for episode batch.
+        
+        Returns:
+            Group definitions
+        """
+        return {
+            "agents": self.args.n_agents
+        }
+
+    def _save_episode_metrics(self, metrics: EpisodeMetrics, test_mode: bool):
+        """
+        Save episode metrics.
+        
+        Args:
+            metrics: Collected metrics
+            test_mode: Whether in testing mode
+        """
+        stats = self.test_stats if test_mode else self.train_stats
+        
+        if metrics.rewards:
+            stats['mean_reward'] = np.mean(metrics.rewards)
+        
+        if metrics.llm_responses:
+            unique_responses = len(set(map(str, metrics.llm_responses)))
+            stats['response_diversity'] = unique_responses / len(metrics.llm_responses)
+        
+        prefix = 'test_' if test_mode else 'train_'
+        for k, v in stats.items():
+            self.logger.log_stat(f"{prefix}{k}", v, self.t_env)
+
+    def _add_llm_data_to_batch(self, metrics: EpisodeMetrics):
+        """
+        Add LLM-related data to episode batch.
+        
+        Args:
+            metrics: Collected LLM metrics
+        """
+        # Paper path: we do not store raw LLM texts into the training batch (keeps buffers small).
+        # Keep this hook for future extensions, but do nothing by default.
+        return
+            
+
+
+
+    def reset(self):
+        """Reset the runner state."""
+        self.batch = self.new_batch()
+        self.env.reset()
+        self.t = 0
+
+    def get_env_info(self) -> Dict:
+        """Get environment information."""
+        return self.env_info
+
+    def save_replay(self):
+        """Save replay buffer."""
+        self.env.save_replay()
+
+    def close_env(self):
+        """Close environment."""
+        self.env.close()
+
+    def log_train_stats_t(self):
+        """Log training statistics."""
+        self.logger.print_recent_stats()
